@@ -9,4 +9,5 @@ path = "src/main.rs"
 
 [dependencies]
 eframe = "0.33"
+egui_commonmark = "0.22"
 libc = "0.2"

@@ -1,4 +1,5 @@
 use eframe::egui;
+use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 use std::fs;
 use std::path::PathBuf;
 
@@ -60,6 +61,9 @@ struct App {
     saved_content: String,
     dirty: bool,
     prev_dirty: bool,
+    preview_mode: bool,
+    prev_preview_mode: bool,
+    commonmark_cache: CommonMarkCache,
     first_frame: bool,
     show_exit_dialog: bool,
     force_exit: bool,
@@ -75,6 +79,9 @@ impl App {
             content,
             dirty: false,
             prev_dirty: false,
+            preview_mode: false,
+            prev_preview_mode: false,
+            commonmark_cache: CommonMarkCache::default(),
             first_frame: true,
             show_exit_dialog: false,
             force_exit: false,
@@ -97,13 +104,13 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Helix/Colibri purple theme
         let mut visuals = egui::Visuals::dark();
-        visuals.override_text_color = None;
+        visuals.override_text_color = Some(egui::Color32::from_rgb(0xa4, 0xa0, 0xe8)); // lavender
         visuals.panel_fill = egui::Color32::from_rgb(0x3b, 0x22, 0x4c);               // midnight purple
         visuals.window_fill = egui::Color32::from_rgb(0x3b, 0x22, 0x4c);
         visuals.extreme_bg_color = egui::Color32::from_rgb(0x28, 0x17, 0x33);         // revolver (TextEdit bg)
         visuals.faint_bg_color = egui::Color32::from_rgb(0x28, 0x17, 0x33);
         visuals.selection.bg_fill = egui::Color32::from_rgb(0x54, 0x00, 0x99);        // selection purple
-        visuals.selection.stroke = egui::Stroke::new(0.0, egui::Color32::WHITE);
+        visuals.selection.stroke = egui::Stroke::new(0.0, egui::Color32::from_rgb(0xa4, 0xa0, 0xe8));
         visuals.warn_fg_color = egui::Color32::from_rgb(0xff, 0xcd, 0x1c);
         visuals.error_fg_color = egui::Color32::from_rgb(0xf4, 0x78, 0x68);
         for widgets in [
@@ -136,6 +143,10 @@ impl eframe::App for App {
             }
         }
 
+        if ctx.input_mut(|i| i.consume_key(cmd, egui::Key::P)) {
+            self.preview_mode = !self.preview_mode;
+        }
+
         // Intercept window close if dirty (but not if user already confirmed)
         if ctx.input(|i| i.viewport().close_requested()) {
             if self.dirty && !self.force_exit {
@@ -144,15 +155,19 @@ impl eframe::App for App {
             }
         }
 
-        // Update title only when dirty state changes
-        if self.dirty != self.prev_dirty {
-            let title = if self.dirty {
-                format!("db - {} [modified]", self.path.display())
-            } else {
-                format!("db - {}", self.path.display())
+        let was_preview = self.preview_mode != self.prev_preview_mode && !self.preview_mode;
+
+        // Update title when dirty or preview state changes
+        if self.dirty != self.prev_dirty || self.preview_mode != self.prev_preview_mode {
+            let title = match (self.dirty, self.preview_mode) {
+                (true, true) => format!("db - {} [modified] [preview]", self.path.display()),
+                (true, false) => format!("db - {} [modified]", self.path.display()),
+                (false, true) => format!("db - {} [preview]", self.path.display()),
+                (false, false) => format!("db - {}", self.path.display()),
             };
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
             self.prev_dirty = self.dirty;
+            self.prev_preview_mode = self.preview_mode;
         }
 
         // Exit confirmation dialog
@@ -211,79 +226,91 @@ impl eframe::App for App {
             let editor_rect = ui.available_rect_before_wrap();
             let scroll_height = editor_rect.height();
 
-            egui::ScrollArea::vertical()
-                .max_height(scroll_height)
-                .auto_shrink(false)
-                .show(ui, |ui| {
-                    let logical_line_count = {
-                        let n = self.content.lines().count().max(1);
-                        if self.content.ends_with('\n') { n + 1 } else { n }
-                    };
-                    let digit_count = format!("{}", logical_line_count).len();
-                    let font_id = egui::TextStyle::Monospace.resolve(ui.style());
-                    let muted = egui::Color32::from_rgb(0x5a, 0x59, 0x77);
-
-                    let sample = "8".repeat(digit_count);
-                    let gutter_text_width = ui.fonts_mut(|f| {
-                        f.layout_no_wrap(sample, font_id.clone(), muted).size().x
+            if self.preview_mode {
+                egui::ScrollArea::vertical()
+                    .max_height(scroll_height)
+                    .auto_shrink(false)
+                    .show(ui, |ui| {
+                        egui::Frame::NONE
+                            .inner_margin(egui::Margin::symmetric(12, 8))
+                            .show(ui, |ui| {
+                                CommonMarkViewer::new().show(ui, &mut self.commonmark_cache, &self.content);
+                            });
                     });
-                    let gutter_padding = 8.0;
-                    let gutter_width = gutter_text_width + gutter_padding;
+            } else {
+                egui::ScrollArea::vertical()
+                    .max_height(scroll_height)
+                    .auto_shrink(false)
+                    .show(ui, |ui| {
+                        let logical_line_count = {
+                            let n = self.content.lines().count().max(1);
+                            if self.content.ends_with('\n') { n + 1 } else { n }
+                        };
+                        let digit_count = format!("{}", logical_line_count).len();
+                        let font_id = egui::TextStyle::Monospace.resolve(ui.style());
+                        let muted = egui::Color32::from_rgb(0x5a, 0x59, 0x77);
 
-                    ui.horizontal_top(|ui| {
-                        let (gutter_rect, _) = ui.allocate_exact_size(
-                            egui::vec2(gutter_width, 0.0),
-                            egui::Sense::hover(),
-                        );
-                        ui.add_space(4.0);
+                        let sample = "8".repeat(digit_count);
+                        let gutter_text_width = ui.fonts_mut(|f| {
+                            f.layout_no_wrap(sample, font_id.clone(), muted).size().x
+                        });
+                        let gutter_padding = 8.0;
+                        let gutter_width = gutter_text_width + gutter_padding;
 
-                        let available = ui.available_width();
-                        let output = egui::TextEdit::multiline(&mut self.content)
-                            .id(editor_id)
-                            .font(egui::TextStyle::Monospace)
-                            .text_color(egui::Color32::from_rgb(0xa4, 0xa0, 0xe8)) // lavender
-                            .desired_width(available)
-                            .frame(false)
-                            .show(ui);
+                        ui.horizontal_top(|ui| {
+                            let (gutter_rect, _) = ui.allocate_exact_size(
+                                egui::vec2(gutter_width, 0.0),
+                                egui::Sense::hover(),
+                            );
+                            ui.add_space(4.0);
 
-                        let galley = &output.galley;
-                        let galley_pos = output.galley_pos;
-                        let painter = ui.painter();
-                        let gutter_right_x = gutter_rect.right() - gutter_padding / 2.0;
+                            let available = ui.available_width();
+                            let output = egui::TextEdit::multiline(&mut self.content)
+                                .id(editor_id)
+                                .font(egui::TextStyle::Monospace)
+                                .desired_width(available)
+                                .frame(false)
+                                .show(ui);
 
-                        let mut logical_line: usize = 1;
-                        let mut prev_ended_with_newline = true;
+                            let galley = &output.galley;
+                            let galley_pos = output.galley_pos;
+                            let painter = ui.painter();
+                            let gutter_right_x = gutter_rect.right() - gutter_padding / 2.0;
 
-                        for placed_row in &galley.rows {
-                            if prev_ended_with_newline {
-                                let num_str = format!("{:>width$}", logical_line, width = digit_count);
+                            let mut logical_line: usize = 1;
+                            let mut prev_ended_with_newline = true;
+
+                            for placed_row in &galley.rows {
+                                if prev_ended_with_newline {
+                                    let num_str = format!("{:>width$}", logical_line, width = digit_count);
+                                    painter.text(
+                                        egui::pos2(gutter_right_x, galley_pos.y + placed_row.pos.y),
+                                        egui::Align2::RIGHT_TOP,
+                                        num_str,
+                                        font_id.clone(),
+                                        muted,
+                                    );
+                                }
+                                if placed_row.ends_with_newline {
+                                    logical_line += 1;
+                                    prev_ended_with_newline = true;
+                                } else {
+                                    prev_ended_with_newline = false;
+                                }
+                            }
+
+                            if galley.rows.is_empty() {
                                 painter.text(
-                                    egui::pos2(gutter_right_x, galley_pos.y + placed_row.pos.y),
+                                    egui::pos2(gutter_right_x, galley_pos.y),
                                     egui::Align2::RIGHT_TOP,
-                                    num_str,
+                                    "1",
                                     font_id.clone(),
                                     muted,
                                 );
                             }
-                            if placed_row.ends_with_newline {
-                                logical_line += 1;
-                                prev_ended_with_newline = true;
-                            } else {
-                                prev_ended_with_newline = false;
-                            }
-                        }
-
-                        if galley.rows.is_empty() {
-                            painter.text(
-                                egui::pos2(gutter_right_x, galley_pos.y),
-                                egui::Align2::RIGHT_TOP,
-                                "1",
-                                font_id.clone(),
-                                muted,
-                            );
-                        }
+                        });
                     });
-                });
+            }
 
             // Status bar at bottom of central panel (disabled for now)
             // ui.horizontal(|ui| {
@@ -321,7 +348,7 @@ impl eframe::App for App {
             }
         }
 
-        if self.first_frame {
+        if self.first_frame || was_preview {
             ctx.memory_mut(|m| m.request_focus(editor_id));
             self.first_frame = false;
         }
