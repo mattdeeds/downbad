@@ -126,6 +126,7 @@ struct App {
     commonmark_cache: CommonMarkCache,
     first_frame: bool,
     show_exit_dialog: bool,
+    show_reload_dialog: bool,
     force_exit: bool,
     cursor_line: usize,
     cursor_col: usize,
@@ -157,6 +158,7 @@ impl App {
             commonmark_cache: CommonMarkCache::default(),
             first_frame: true,
             show_exit_dialog: false,
+            show_reload_dialog: false,
             force_exit: false,
             cursor_line: 0,
             cursor_col: 0,
@@ -181,6 +183,19 @@ impl App {
         } else {
             self.saved_content = self.content.clone();
             self.dirty = false;
+        }
+    }
+
+    fn reload_file(&mut self) {
+        match fs::read_to_string(&self.path) {
+            Ok(new_content) => {
+                self.content = new_content;
+                self.saved_content = self.content.clone();
+            }
+            Err(e) => {
+                self.stt_error = Some(format!("Reload failed: {e}"));
+                self.stt_error_time = Some(std::time::Instant::now());
+            }
         }
     }
 
@@ -346,6 +361,14 @@ impl eframe::App for App {
             self.preview_mode = !self.preview_mode;
         }
 
+        if ctx.input_mut(|i| i.consume_key(cmd, egui::Key::R)) {
+            if self.dirty {
+                self.show_reload_dialog = true;
+            } else {
+                self.reload_file();
+            }
+        }
+
         // Cmd+D: toggle speech-to-text recording
         if ctx.input_mut(|i| i.consume_key(cmd, egui::Key::D)) {
             if self.transcribing {
@@ -497,6 +520,42 @@ impl eframe::App for App {
                 });
         }
 
+        // Reload confirmation dialog
+        if self.show_reload_dialog {
+            let (pressed_r, pressed_esc) = ctx.input_mut(|i| {
+                let r = i.consume_key(egui::Modifiers::NONE, egui::Key::R);
+                let esc = i.consume_key(egui::Modifiers::NONE, egui::Key::Escape);
+                i.events.clear();
+                (r, esc)
+            });
+
+            if pressed_r {
+                self.show_reload_dialog = false;
+                self.reload_file();
+            } else if pressed_esc {
+                self.show_reload_dialog = false;
+            }
+
+            egui::Window::new("Reload File")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .frame(egui::Frame::window(ctx.style().as_ref()).fill(egui::Color32::BLACK))
+                .show(ctx, |ui| {
+                    ui.label("You have unsaved changes. Reload and discard them?");
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("[R]eload").clicked() {
+                            self.show_reload_dialog = false;
+                            self.reload_file();
+                        }
+                        if ui.button("Cancel (Esc)").clicked() {
+                            self.show_reload_dialog = false;
+                        }
+                    });
+                });
+        }
+
         // STT error popup
         if let Some(ref err) = self.stt_error.clone() {
             let should_dismiss = self
@@ -525,7 +584,7 @@ impl eframe::App for App {
         // Main editor panel with status bar at bottom
         let editor_id = egui::Id::new("editor");
         egui::CentralPanel::default().show(ctx, |ui| {
-            if self.show_exit_dialog {
+            if self.show_exit_dialog || self.show_reload_dialog {
                 ui.disable();
             }
 
