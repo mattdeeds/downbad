@@ -1,7 +1,67 @@
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use eframe::egui;
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 use std::fs;
 use std::path::PathBuf;
+use std::sync::{mpsc, Arc, Mutex};
+use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
+
+fn whisper_model_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    PathBuf::from(home)
+        .join(".local/share/downbad")
+        .join("ggml-base.en.bin")
+}
+
+fn transcribe_audio(
+    ctx: Arc<WhisperContext>,
+    samples: Vec<f32>,
+    source_rate: u32,
+) -> Result<String, String> {
+    // Resample to 16kHz mono via linear interpolation
+    let target_rate = 16000u32;
+    let resampled = if source_rate == target_rate {
+        samples
+    } else {
+        let ratio = source_rate as f64 / target_rate as f64;
+        let output_len = (samples.len() as f64 / ratio) as usize;
+        let mut output = Vec::with_capacity(output_len);
+        for i in 0..output_len {
+            let src_idx = i as f64 * ratio;
+            let idx0 = src_idx as usize;
+            let frac = (src_idx - idx0 as f64) as f32;
+            let s0 = samples.get(idx0).copied().unwrap_or(0.0);
+            let s1 = samples.get(idx0 + 1).copied().unwrap_or(s0);
+            output.push(s0 + frac * (s1 - s0));
+        }
+        output
+    };
+
+    let mut state = ctx.create_state().map_err(|e| format!("Whisper state error: {e}"))?;
+    let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+    params.set_n_threads(4);
+    params.set_print_special(false);
+    params.set_print_progress(false);
+    params.set_print_realtime(false);
+    params.set_print_timestamps(false);
+    params.set_suppress_blank(true);
+    params.set_language(Some("en"));
+
+    state
+        .full(params, &resampled)
+        .map_err(|e| format!("Whisper inference error: {e}"))?;
+
+    let num_segments = state.full_n_segments();
+    let mut text = String::new();
+    for i in 0..num_segments {
+        if let Some(segment) = state.get_segment(i) {
+            if let Ok(s) = segment.to_str() {
+                text.push_str(s);
+            }
+        }
+    }
+    Ok(text.trim().to_string())
+}
 
 fn main() -> eframe::Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -69,6 +129,19 @@ struct App {
     force_exit: bool,
     cursor_line: usize,
     cursor_col: usize,
+    // Speech-to-text fields
+    recording: bool,
+    prev_recording: bool,
+    audio_stream: Option<cpal::Stream>,
+    audio_buffer: Arc<Mutex<Vec<f32>>>,
+    audio_sample_rate: u32,
+    audio_channels: u16,
+    transcribing: bool,
+    prev_transcribing: bool,
+    transcription_rx: Option<mpsc::Receiver<Result<String, String>>>,
+    whisper_ctx: Option<Arc<WhisperContext>>,
+    stt_error: Option<String>,
+    stt_error_time: Option<std::time::Instant>,
 }
 
 impl App {
@@ -87,6 +160,18 @@ impl App {
             force_exit: false,
             cursor_line: 0,
             cursor_col: 0,
+            recording: false,
+            prev_recording: false,
+            audio_stream: None,
+            audio_buffer: Arc::new(Mutex::new(Vec::new())),
+            audio_sample_rate: 44100,
+            audio_channels: 1,
+            transcribing: false,
+            prev_transcribing: false,
+            transcription_rx: None,
+            whisper_ctx: None,
+            stt_error: None,
+            stt_error_time: None,
         }
     }
 
@@ -97,6 +182,120 @@ impl App {
             self.saved_content = self.content.clone();
             self.dirty = false;
         }
+    }
+
+    fn load_whisper_model(&mut self) -> Result<Arc<WhisperContext>, String> {
+        if let Some(ref ctx) = self.whisper_ctx {
+            return Ok(Arc::clone(ctx));
+        }
+        let model_path = whisper_model_path();
+        if !model_path.exists() {
+            return Err(format!(
+                "Whisper model not found at {}. Download it first.",
+                model_path.display()
+            ));
+        }
+        let ctx = WhisperContext::new_with_params(
+            model_path.to_str().unwrap_or_default(),
+            WhisperContextParameters::default(),
+        )
+        .map_err(|e| format!("Failed to load Whisper model: {e}"))?;
+        let ctx = Arc::new(ctx);
+        self.whisper_ctx = Some(Arc::clone(&ctx));
+        Ok(ctx)
+    }
+
+    fn start_recording(&mut self) -> Result<(), String> {
+        // Fail-fast: check model file exists before recording
+        let model_path = whisper_model_path();
+        if !model_path.exists() {
+            return Err(format!(
+                "Whisper model not found at {}",
+                model_path.display()
+            ));
+        }
+
+        let host = cpal::default_host();
+        let device = host
+            .default_input_device()
+            .ok_or("No microphone found")?;
+        let config = device
+            .default_input_config()
+            .map_err(|e| format!("No input config: {e}"))?;
+
+        self.audio_sample_rate = config.sample_rate().0;
+        self.audio_channels = config.channels();
+
+        let buffer = Arc::clone(&self.audio_buffer);
+        buffer.lock().unwrap().clear();
+
+        let channels = self.audio_channels as usize;
+        let stream = device
+            .build_input_stream(
+                &config.into(),
+                move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                    let mut buf = buffer.lock().unwrap();
+                    // Downmix to mono
+                    if channels == 1 {
+                        buf.extend_from_slice(data);
+                    } else {
+                        for chunk in data.chunks(channels) {
+                            let sum: f32 = chunk.iter().sum();
+                            buf.push(sum / channels as f32);
+                        }
+                    }
+                },
+                move |err| {
+                    eprintln!("Audio input error: {err}");
+                },
+                None,
+            )
+            .map_err(|e| format!("Failed to build input stream: {e}"))?;
+
+        stream.play().map_err(|e| format!("Failed to start recording: {e}"))?;
+
+        self.audio_stream = Some(stream);
+        self.recording = true;
+        Ok(())
+    }
+
+    fn stop_recording_and_transcribe(&mut self) {
+        // Drop the stream to stop recording
+        self.audio_stream = None;
+        self.recording = false;
+
+        // Take the audio buffer
+        let samples = {
+            let mut buf = self.audio_buffer.lock().unwrap();
+            std::mem::take(&mut *buf)
+        };
+
+        if samples.is_empty() {
+            self.stt_error = Some("No audio captured".to_string());
+            self.stt_error_time = Some(std::time::Instant::now());
+            return;
+        }
+
+        // Load whisper model (lazy, first time only)
+        let ctx = match self.load_whisper_model() {
+            Ok(ctx) => ctx,
+            Err(e) => {
+                self.stt_error = Some(e);
+                self.stt_error_time = Some(std::time::Instant::now());
+                return;
+            }
+        };
+
+        let source_rate = self.audio_sample_rate;
+        let (tx, rx) = mpsc::channel();
+
+        std::thread::spawn(move || {
+            let result = transcribe_audio(ctx, samples, source_rate);
+            let _ = tx.send(result);
+        });
+
+        self.transcription_rx = Some(rx);
+        self.transcribing = true;
     }
 }
 
@@ -147,6 +346,20 @@ impl eframe::App for App {
             self.preview_mode = !self.preview_mode;
         }
 
+        // Cmd+D: toggle speech-to-text recording
+        if ctx.input_mut(|i| i.consume_key(cmd, egui::Key::D)) {
+            if self.transcribing {
+                // Ignore while transcribing
+            } else if self.recording {
+                self.stop_recording_and_transcribe();
+            } else {
+                if let Err(e) = self.start_recording() {
+                    self.stt_error = Some(e);
+                    self.stt_error_time = Some(std::time::Instant::now());
+                }
+            }
+        }
+
         // Intercept window close if dirty (but not if user already confirmed)
         if ctx.input(|i| i.viewport().close_requested()) {
             if self.dirty && !self.force_exit {
@@ -157,17 +370,85 @@ impl eframe::App for App {
 
         let was_preview = self.preview_mode != self.prev_preview_mode && !self.preview_mode;
 
-        // Update title when dirty or preview state changes
-        if self.dirty != self.prev_dirty || self.preview_mode != self.prev_preview_mode {
-            let title = match (self.dirty, self.preview_mode) {
-                (true, true) => format!("db - {} [modified] [preview]", self.path.display()),
-                (true, false) => format!("db - {} [modified]", self.path.display()),
-                (false, true) => format!("db - {} [preview]", self.path.display()),
-                (false, false) => format!("db - {}", self.path.display()),
-            };
+        // Per-frame transcription polling
+        if self.transcribing {
+            ctx.request_repaint();
+            if let Some(ref rx) = self.transcription_rx {
+                match rx.try_recv() {
+                    Ok(Ok(text)) => {
+                        self.transcribing = false;
+                        self.transcription_rx = None;
+                        if text.is_empty() {
+                            self.stt_error = Some("No speech detected".to_string());
+                            self.stt_error_time = Some(std::time::Instant::now());
+                        } else {
+                            // Insert text at cursor position
+                            let editor_id = egui::Id::new("editor");
+                            let byte_idx = if let Some(state) = egui::TextEdit::load_state(ctx, editor_id) {
+                                if let Some(ccursor_range) = state.cursor.char_range() {
+                                    let idx = ccursor_range.primary.index;
+                                    self.content.char_indices()
+                                        .nth(idx)
+                                        .map_or(self.content.len(), |(i, _)| i)
+                                } else {
+                                    self.content.len()
+                                }
+                            } else {
+                                self.content.len()
+                            };
+
+                            // Add a leading space if we're not at start and previous char isn't whitespace
+                            let needs_space = byte_idx > 0
+                                && !self.content[..byte_idx].ends_with(char::is_whitespace);
+                            let insert = if needs_space {
+                                format!(" {text}")
+                            } else {
+                                text
+                            };
+                            self.content.insert_str(byte_idx, &insert);
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        self.transcribing = false;
+                        self.transcription_rx = None;
+                        self.stt_error = Some(e);
+                        self.stt_error_time = Some(std::time::Instant::now());
+                    }
+                    Err(mpsc::TryRecvError::Empty) => {}
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        self.transcribing = false;
+                        self.transcription_rx = None;
+                        self.stt_error = Some("Transcription thread crashed".to_string());
+                        self.stt_error_time = Some(std::time::Instant::now());
+                    }
+                }
+            }
+        }
+
+        // Update title when dirty, preview, recording, or transcribing state changes
+        if self.dirty != self.prev_dirty
+            || self.preview_mode != self.prev_preview_mode
+            || self.recording != self.prev_recording
+            || self.transcribing != self.prev_transcribing
+        {
+            let mut title = format!("db - {}", self.path.display());
+            if self.dirty {
+                title.push_str(" [modified]");
+            }
+            if self.preview_mode {
+                title.push_str(" [preview]");
+            }
+            if self.recording {
+                title.push_str(" [recording]");
+            }
+            if self.transcribing {
+                title.push_str(" [transcribing]");
+            }
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
             self.prev_dirty = self.dirty;
             self.prev_preview_mode = self.preview_mode;
+            self.prev_recording = self.recording;
+            self.prev_transcribing = self.transcribing;
         }
 
         // Exit confirmation dialog
@@ -214,6 +495,31 @@ impl eframe::App for App {
                         }
                     });
                 });
+        }
+
+        // STT error popup
+        if let Some(ref err) = self.stt_error.clone() {
+            let should_dismiss = self
+                .stt_error_time
+                .is_some_and(|t| t.elapsed().as_secs() >= 5);
+            if should_dismiss {
+                self.stt_error = None;
+                self.stt_error_time = None;
+            } else {
+                ctx.request_repaint();
+                egui::Area::new(egui::Id::new("stt_error"))
+                    .anchor(egui::Align2::CENTER_TOP, [0.0, 8.0])
+                    .show(ctx, |ui| {
+                        egui::Frame::popup(ui.style())
+                            .fill(egui::Color32::from_rgb(0x44, 0x11, 0x11))
+                            .show(ui, |ui| {
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(0xf4, 0x78, 0x68),
+                                    err,
+                                );
+                            });
+                    });
+            }
         }
 
         // Main editor panel with status bar at bottom
@@ -311,28 +617,6 @@ impl eframe::App for App {
                         });
                     });
             }
-
-            // Status bar at bottom of central panel (disabled for now)
-            // ui.horizontal(|ui| {
-            //     let mono = egui::TextStyle::Monospace;
-            //     let muted = egui::Color32::from_rgb(0x5a, 0x59, 0x77); // comet
-            //     let display_path = {
-            //         let fname = self.path.file_name().unwrap_or_default().to_string_lossy();
-            //         match self.path.parent().and_then(|p| p.file_name()) {
-            //             Some(dir) => format!("{}/{}", dir.to_string_lossy(), fname),
-            //             None => fname.into_owned(),
-            //         }
-            //     };
-            //     ui.label(egui::RichText::new(display_path).text_style(mono.clone()).color(muted));
-            //     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            //         let lines = self.content.lines().count().max(1);
-            //         let ln = self.cursor_line + 1;
-            //         let col = self.cursor_col + 1;
-            //         ui.label(egui::RichText::new(
-            //             format!("Ln {ln}, Col {col}  |  {lines} lines")
-            //         ).text_style(mono).color(muted));
-            //     });
-            // });
         });
 
         // Extract cursor position from TextEdit state
