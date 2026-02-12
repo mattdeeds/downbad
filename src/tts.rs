@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{mpsc, Mutex};
 
 pub struct KokoroTts {
     session: Mutex<ort::session::Session>,
@@ -68,40 +68,64 @@ impl KokoroTts {
         })
     }
 
+    #[allow(dead_code)]
     pub fn synthesize(&self, text: &str) -> Result<Vec<f32>, String> {
         let sentences = split_sentences(text);
         let mut all_audio = Vec::new();
 
         for sentence in &sentences {
-            let ipa = phonemize(sentence)?;
-            let misaki = espeak_ipa_to_misaki(&ipa);
-            let inner_tokens = self.tokenize(&misaki);
-            if inner_tokens.is_empty() {
-                continue;
+            if let Some(audio) = self.synthesize_sentence(sentence)? {
+                all_audio.extend_from_slice(&audio);
             }
-
-            // Truncate to 510 tokens max (+ 2 BOS/EOS = 512)
-            let inner_tokens = if inner_tokens.len() > 510 {
-                &inner_tokens[..510]
-            } else {
-                &inner_tokens[..]
-            };
-
-            let style = self.get_style_vector(inner_tokens.len());
-
-            let mut tokens = Vec::with_capacity(inner_tokens.len() + 2);
-            tokens.push(0i64);
-            tokens.extend_from_slice(inner_tokens);
-            tokens.push(0i64);
-
-            let audio = self.run_inference(&tokens, &style)?;
-            all_audio.extend_from_slice(&audio);
         }
 
         if all_audio.is_empty() {
             return Err("No audio produced from text".to_string());
         }
         Ok(all_audio)
+    }
+
+    pub fn synthesize_streaming(&self, text: &str, tx: mpsc::Sender<Result<Vec<f32>, String>>) {
+        let sentences = split_sentences(text);
+        for sentence in &sentences {
+            match self.synthesize_sentence(sentence) {
+                Ok(Some(audio)) => {
+                    if tx.send(Ok(audio)).is_err() {
+                        return;
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    let _ = tx.send(Err(e));
+                    return;
+                }
+            }
+        }
+    }
+
+    fn synthesize_sentence(&self, sentence: &str) -> Result<Option<Vec<f32>>, String> {
+        let ipa = phonemize(sentence)?;
+        let misaki = espeak_ipa_to_misaki(&ipa);
+        let inner_tokens = self.tokenize(&misaki);
+        if inner_tokens.is_empty() {
+            return Ok(None);
+        }
+
+        let inner_tokens = if inner_tokens.len() > 510 {
+            &inner_tokens[..510]
+        } else {
+            &inner_tokens[..]
+        };
+
+        let style = self.get_style_vector(inner_tokens.len());
+
+        let mut tokens = Vec::with_capacity(inner_tokens.len() + 2);
+        tokens.push(0i64);
+        tokens.extend_from_slice(inner_tokens);
+        tokens.push(0i64);
+
+        let audio = self.run_inference(&tokens, &style)?;
+        Ok(Some(audio))
     }
 
     fn run_inference(&self, tokens: &[i64], style: &[f32]) -> Result<Vec<f32>, String> {

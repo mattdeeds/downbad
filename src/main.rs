@@ -117,6 +117,12 @@ fn main() -> eframe::Result<()> {
     )
 }
 
+struct TtsPlayback {
+    samples: Vec<f32>,
+    cursor: usize,
+    done: bool,
+}
+
 struct App {
     path: PathBuf,
     content: String,
@@ -152,7 +158,9 @@ struct App {
     prev_generating_speech: bool,
     tts_ctx: Option<Arc<tts::KokoroTts>>,
     tts_audio_stream: Option<cpal::Stream>,
-    tts_playback: Option<Arc<Mutex<(Vec<f32>, usize)>>>,
+    tts_playback: Option<Arc<Mutex<TtsPlayback>>>,
+    tts_device_rate: u32,
+    tts_device_channels: usize,
     speech_rx: Option<mpsc::Receiver<Result<Vec<f32>, String>>>,
 }
 
@@ -192,6 +200,8 @@ impl App {
             tts_ctx: None,
             tts_audio_stream: None,
             tts_playback: None,
+            tts_device_rate: 0,
+            tts_device_channels: 0,
             speech_rx: None,
         }
     }
@@ -319,17 +329,37 @@ impl App {
             }
         };
 
+        // Resolve output device config once up front
+        let host = cpal::default_host();
+        let device = match host.default_output_device() {
+            Some(d) => d,
+            None => {
+                self.stt_error = Some("No audio output device found".to_string());
+                self.stt_error_time = Some(std::time::Instant::now());
+                return;
+            }
+        };
+        let config = match device.default_output_config() {
+            Ok(c) => c,
+            Err(e) => {
+                self.stt_error = Some(format!("No output config: {e}"));
+                self.stt_error_time = Some(std::time::Instant::now());
+                return;
+            }
+        };
+        self.tts_device_rate = config.sample_rate().0;
+        self.tts_device_channels = config.channels() as usize;
+
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
-            let result = tts_ctx.synthesize(&text);
-            let _ = tx.send(result);
+            tts_ctx.synthesize_streaming(&text, tx);
         });
 
         self.speech_rx = Some(rx);
         self.generating_speech = true;
     }
 
-    fn begin_playback(&mut self, samples: Vec<f32>) {
+    fn start_audio_stream(&mut self, playback: Arc<Mutex<TtsPlayback>>) {
         let host = cpal::default_host();
         let device = match host.default_output_device() {
             Some(d) => d,
@@ -348,29 +378,20 @@ impl App {
             }
         };
 
-        let device_rate = config.sample_rate().0;
         let device_channels = config.channels() as usize;
-
-        // Resample from 24kHz to device rate
-        let resampled = tts::resample(&samples, 24000, device_rate);
-
-        let playback = Arc::new(Mutex::new((resampled, 0usize)));
-        self.tts_playback = Some(Arc::clone(&playback));
 
         let stream = match device.build_output_stream(
             &config.into(),
             move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
                 let mut state = playback.lock().unwrap();
-                let (ref samples, ref mut cursor) = *state;
                 for frame in data.chunks_mut(device_channels) {
-                    let sample = if *cursor < samples.len() {
-                        let s = samples[*cursor];
-                        *cursor += 1;
+                    let sample = if state.cursor < state.samples.len() {
+                        let s = state.samples[state.cursor];
+                        state.cursor += 1;
                         s
                     } else {
                         0.0
                     };
-                    // Duplicate mono sample to all channels
                     for ch in frame.iter_mut() {
                         *ch = sample;
                     }
@@ -610,29 +631,51 @@ impl eframe::App for App {
             }
         }
 
-        // Per-frame TTS polling
+        // Per-frame TTS polling — drain all ready chunks
         if self.generating_speech {
             ctx.request_repaint();
+            // Drain channel into a local vec to avoid borrow conflicts
+            let mut chunks: Vec<Vec<f32>> = Vec::new();
+            let mut tts_error: Option<String> = None;
+            let mut disconnected = false;
             if let Some(ref rx) = self.speech_rx {
-                match rx.try_recv() {
-                    Ok(Ok(samples)) => {
-                        self.generating_speech = false;
-                        self.speech_rx = None;
-                        self.begin_playback(samples);
+                loop {
+                    match rx.try_recv() {
+                        Ok(Ok(samples)) => {
+                            chunks.push(tts::resample(&samples, 24000, self.tts_device_rate));
+                        }
+                        Ok(Err(e)) => { tts_error = Some(e); break; }
+                        Err(mpsc::TryRecvError::Empty) => break,
+                        Err(mpsc::TryRecvError::Disconnected) => { disconnected = true; break; }
                     }
-                    Ok(Err(e)) => {
-                        self.generating_speech = false;
-                        self.speech_rx = None;
-                        self.stt_error = Some(e);
-                        self.stt_error_time = Some(std::time::Instant::now());
+                }
+            }
+            // Process collected chunks
+            for resampled in chunks {
+                if self.speaking {
+                    if let Some(ref pb) = self.tts_playback {
+                        pb.lock().unwrap().samples.extend_from_slice(&resampled);
                     }
-                    Err(mpsc::TryRecvError::Empty) => {}
-                    Err(mpsc::TryRecvError::Disconnected) => {
-                        self.generating_speech = false;
-                        self.speech_rx = None;
-                        self.stt_error = Some("TTS thread crashed".to_string());
-                        self.stt_error_time = Some(std::time::Instant::now());
-                    }
+                } else {
+                    let pb = Arc::new(Mutex::new(TtsPlayback {
+                        samples: resampled,
+                        cursor: 0,
+                        done: false,
+                    }));
+                    self.tts_playback = Some(Arc::clone(&pb));
+                    self.start_audio_stream(pb);
+                }
+            }
+            if let Some(e) = tts_error {
+                self.generating_speech = false;
+                self.speech_rx = None;
+                self.stt_error = Some(e);
+                self.stt_error_time = Some(std::time::Instant::now());
+            } else if disconnected {
+                self.generating_speech = false;
+                self.speech_rx = None;
+                if let Some(ref pb) = self.tts_playback {
+                    pb.lock().unwrap().done = true;
                 }
             }
         }
@@ -642,7 +685,7 @@ impl eframe::App for App {
             ctx.request_repaint();
             if let Some(ref playback) = self.tts_playback {
                 let state = playback.lock().unwrap();
-                if state.1 >= state.0.len() {
+                if state.cursor >= state.samples.len() && state.done {
                     drop(state);
                     self.stop_speaking();
                 }
