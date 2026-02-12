@@ -40,7 +40,7 @@ This builds a release binary and installs `db` to `~/.cargo/bin/`. Make sure `~/
 | D | Discard & Exit |
 | Esc | Cancel |
 
-## Speech-to-Text
+## Speech-to-Text (Whisper)
 
 Cmd+D starts recording from the default microphone. Press Cmd+D again to stop and transcribe. The Whisper model is loaded lazily on first use, so it never slows down app startup.
 
@@ -52,7 +52,7 @@ curl -L -o ~/.local/share/downbad/ggml-base.en.bin \
   https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin
 ```
 
-## Text-to-Speech
+## Text-to-Speech (Kokoro)
 
 Cmd+T speaks the selected text (or full document if nothing is selected) aloud using the Kokoro-82M TTS model running locally via ONNX Runtime. Press Cmd+T again to stop playback.
 
