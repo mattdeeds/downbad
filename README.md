@@ -1,4 +1,4 @@
-# downbad
+# db - downbad
 
 A minimal markdown editor for macOS built with Rust and egui.
 
@@ -7,6 +7,18 @@ db <filename>
 ```
 
 Opens the file in a raw text editor with line numbers. The process detaches from the terminal so your shell prompt returns immediately.
+
+| Editing | Preview (Cmd+P) |
+|---------|-----------------|
+| ![Editor](assets/edit.png) | ![Preview](assets/preview.png) |
+
+## Installation
+
+```bash
+cargo install --path .
+```
+
+This builds a release binary and installs `db` to `~/.cargo/bin/`. Make sure `~/.cargo/bin` is in your `PATH`.
 
 ## Keyboard Shortcuts
 
