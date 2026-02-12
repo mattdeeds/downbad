@@ -17,6 +17,7 @@ Opens the file in a raw text editor with line numbers. The process detaches from
 | Cmd+P | Toggle markdown preview |
 | Cmd+R | Reload file from disk |
 | Cmd+D | Toggle speech-to-text recording |
+| Cmd+T | Text-to-speech (selection or document) |
 | Cmd+C/V/X | Copy / Paste / Cut |
 
 ### Unsaved Changes Dialog
@@ -37,4 +38,25 @@ Cmd+D starts recording from the default microphone. Press Cmd+D again to stop an
 mkdir -p ~/.local/share/downbad
 curl -L -o ~/.local/share/downbad/ggml-base.en.bin \
   https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin
+```
+
+## Text-to-Speech
+
+Cmd+T speaks the selected text (or full document if nothing is selected) aloud using the Kokoro-82M TTS model running locally via ONNX Runtime. Press Cmd+T again to stop playback.
+
+### Setup (one-time)
+
+Download the three model files into `~/.local/share/downbad/`:
+
+```bash
+mkdir -p ~/.local/share/downbad
+# ONNX model (quantized, ~92 MB)
+curl -L -o ~/.local/share/downbad/kokoro-v1.0.onnx \
+  https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/main/onnx/model_quantized.onnx
+# Tokenizer
+curl -L -o ~/.local/share/downbad/kokoro-tokenizer.json \
+  https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/main/tokenizer.json
+# Voice style (af_heart)
+curl -L -o ~/.local/share/downbad/kokoro-voice.bin \
+  https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/main/voices/af_heart.bin
 ```

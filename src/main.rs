@@ -1,3 +1,5 @@
+mod tts;
+
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use eframe::egui;
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
@@ -143,6 +145,15 @@ struct App {
     whisper_ctx: Option<Arc<WhisperContext>>,
     stt_error: Option<String>,
     stt_error_time: Option<std::time::Instant>,
+    // Text-to-speech fields
+    speaking: bool,
+    prev_speaking: bool,
+    generating_speech: bool,
+    prev_generating_speech: bool,
+    tts_ctx: Option<Arc<tts::KokoroTts>>,
+    tts_audio_stream: Option<cpal::Stream>,
+    tts_playback: Option<Arc<Mutex<(Vec<f32>, usize)>>>,
+    speech_rx: Option<mpsc::Receiver<Result<Vec<f32>, String>>>,
 }
 
 impl App {
@@ -174,6 +185,14 @@ impl App {
             whisper_ctx: None,
             stt_error: None,
             stt_error_time: None,
+            speaking: false,
+            prev_speaking: false,
+            generating_speech: false,
+            prev_generating_speech: false,
+            tts_ctx: None,
+            tts_audio_stream: None,
+            tts_playback: None,
+            speech_rx: None,
         }
     }
 
@@ -272,6 +291,112 @@ impl App {
         self.audio_stream = Some(stream);
         self.recording = true;
         Ok(())
+    }
+
+    fn load_tts_model(&mut self) -> Result<Arc<tts::KokoroTts>, String> {
+        if let Some(ref ctx) = self.tts_ctx {
+            return Ok(Arc::clone(ctx));
+        }
+        let ctx = tts::KokoroTts::new()?;
+        let ctx = Arc::new(ctx);
+        self.tts_ctx = Some(Arc::clone(&ctx));
+        Ok(ctx)
+    }
+
+    fn stop_speaking(&mut self) {
+        self.tts_audio_stream = None;
+        self.tts_playback = None;
+        self.speaking = false;
+    }
+
+    fn start_speaking(&mut self, text: String) {
+        let tts_ctx = match self.load_tts_model() {
+            Ok(ctx) => ctx,
+            Err(e) => {
+                self.stt_error = Some(e);
+                self.stt_error_time = Some(std::time::Instant::now());
+                return;
+            }
+        };
+
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let result = tts_ctx.synthesize(&text);
+            let _ = tx.send(result);
+        });
+
+        self.speech_rx = Some(rx);
+        self.generating_speech = true;
+    }
+
+    fn begin_playback(&mut self, samples: Vec<f32>) {
+        let host = cpal::default_host();
+        let device = match host.default_output_device() {
+            Some(d) => d,
+            None => {
+                self.stt_error = Some("No audio output device found".to_string());
+                self.stt_error_time = Some(std::time::Instant::now());
+                return;
+            }
+        };
+        let config = match device.default_output_config() {
+            Ok(c) => c,
+            Err(e) => {
+                self.stt_error = Some(format!("No output config: {e}"));
+                self.stt_error_time = Some(std::time::Instant::now());
+                return;
+            }
+        };
+
+        let device_rate = config.sample_rate().0;
+        let device_channels = config.channels() as usize;
+
+        // Resample from 24kHz to device rate
+        let resampled = tts::resample(&samples, 24000, device_rate);
+
+        let playback = Arc::new(Mutex::new((resampled, 0usize)));
+        self.tts_playback = Some(Arc::clone(&playback));
+
+        let stream = match device.build_output_stream(
+            &config.into(),
+            move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                let mut state = playback.lock().unwrap();
+                let (ref samples, ref mut cursor) = *state;
+                for frame in data.chunks_mut(device_channels) {
+                    let sample = if *cursor < samples.len() {
+                        let s = samples[*cursor];
+                        *cursor += 1;
+                        s
+                    } else {
+                        0.0
+                    };
+                    // Duplicate mono sample to all channels
+                    for ch in frame.iter_mut() {
+                        *ch = sample;
+                    }
+                }
+            },
+            |err| {
+                eprintln!("Audio output error: {err}");
+            },
+            None,
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                self.stt_error = Some(format!("Failed to build output stream: {e}"));
+                self.stt_error_time = Some(std::time::Instant::now());
+                return;
+            }
+        };
+
+        if let Err(e) = stream.play() {
+            self.stt_error = Some(format!("Failed to start playback: {e}"));
+            self.stt_error_time = Some(std::time::Instant::now());
+            return;
+        }
+
+        self.tts_audio_stream = Some(stream);
+        self.speaking = true;
     }
 
     fn stop_recording_and_transcribe(&mut self) {
@@ -383,6 +508,43 @@ impl eframe::App for App {
             }
         }
 
+        // Cmd+T: toggle text-to-speech
+        if ctx.input_mut(|i| i.consume_key(cmd, egui::Key::T)) {
+            if self.speaking || self.generating_speech {
+                // Stop playback / cancel generation
+                self.stop_speaking();
+                self.generating_speech = false;
+                self.speech_rx = None;
+            } else {
+                // Get selected text, or fall back to full document
+                let editor_id = egui::Id::new("editor");
+                let text = if let Some(state) = egui::TextEdit::load_state(ctx, editor_id) {
+                    if let Some(ccursor_range) = state.cursor.char_range() {
+                        let start = ccursor_range.sorted_cursors()[0].index;
+                        let end = ccursor_range.sorted_cursors()[1].index;
+                        if start != end {
+                            // Has selection
+                            let chars: Vec<char> = self.content.chars().collect();
+                            let s = start.min(chars.len());
+                            let e = end.min(chars.len());
+                            chars[s..e].iter().collect::<String>()
+                        } else {
+                            self.content.clone()
+                        }
+                    } else {
+                        self.content.clone()
+                    }
+                } else {
+                    self.content.clone()
+                };
+
+                let text = text.trim().to_string();
+                if !text.is_empty() {
+                    self.start_speaking(text);
+                }
+            }
+        }
+
         // Intercept window close if dirty (but not if user already confirmed)
         if ctx.input(|i| i.viewport().close_requested()) {
             if self.dirty && !self.force_exit {
@@ -448,11 +610,52 @@ impl eframe::App for App {
             }
         }
 
-        // Update title when dirty, preview, recording, or transcribing state changes
+        // Per-frame TTS polling
+        if self.generating_speech {
+            ctx.request_repaint();
+            if let Some(ref rx) = self.speech_rx {
+                match rx.try_recv() {
+                    Ok(Ok(samples)) => {
+                        self.generating_speech = false;
+                        self.speech_rx = None;
+                        self.begin_playback(samples);
+                    }
+                    Ok(Err(e)) => {
+                        self.generating_speech = false;
+                        self.speech_rx = None;
+                        self.stt_error = Some(e);
+                        self.stt_error_time = Some(std::time::Instant::now());
+                    }
+                    Err(mpsc::TryRecvError::Empty) => {}
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        self.generating_speech = false;
+                        self.speech_rx = None;
+                        self.stt_error = Some("TTS thread crashed".to_string());
+                        self.stt_error_time = Some(std::time::Instant::now());
+                    }
+                }
+            }
+        }
+
+        // Check if TTS playback finished
+        if self.speaking {
+            ctx.request_repaint();
+            if let Some(ref playback) = self.tts_playback {
+                let state = playback.lock().unwrap();
+                if state.1 >= state.0.len() {
+                    drop(state);
+                    self.stop_speaking();
+                }
+            }
+        }
+
+        // Update title when state changes
         if self.dirty != self.prev_dirty
             || self.preview_mode != self.prev_preview_mode
             || self.recording != self.prev_recording
             || self.transcribing != self.prev_transcribing
+            || self.speaking != self.prev_speaking
+            || self.generating_speech != self.prev_generating_speech
         {
             let mut title = format!("db - {}", self.path.display());
             if self.dirty {
@@ -467,11 +670,19 @@ impl eframe::App for App {
             if self.transcribing {
                 title.push_str(" [transcribing]");
             }
+            if self.generating_speech {
+                title.push_str(" [generating...]");
+            }
+            if self.speaking {
+                title.push_str(" [speaking]");
+            }
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
             self.prev_dirty = self.dirty;
             self.prev_preview_mode = self.preview_mode;
             self.prev_recording = self.recording;
             self.prev_transcribing = self.transcribing;
+            self.prev_speaking = self.speaking;
+            self.prev_generating_speech = self.generating_speech;
         }
 
         // Exit confirmation dialog
