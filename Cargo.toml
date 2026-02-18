@@ -9,9 +9,8 @@ name = "db"
 path = "src/main.rs"
 
 [dependencies]
-eframe = "0.33"
+eframe = { version = "0.33", features = ["wgpu"] }
 egui_commonmark = "0.22"
-libc = "0.2"
 whisper-rs = "0.15"
 cpal = "0.15"
 espeak-rs = "0.1"

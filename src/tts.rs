@@ -202,7 +202,29 @@ fn data_dir() -> PathBuf {
     PathBuf::from(home).join(".local/share/downbad")
 }
 
+fn ensure_espeak_data() {
+    if std::env::var("PIPER_ESPEAKNG_DATA_DIRECTORY").is_ok() {
+        return;
+    }
+    // Homebrew on Apple Silicon
+    let candidates = [
+        "/opt/homebrew/Cellar/espeak-ng/1.52.0/share",
+        "/opt/homebrew/share",
+        "/usr/local/share",
+        "/usr/share",
+    ];
+    for dir in &candidates {
+        let path = PathBuf::from(dir).join("espeak-ng-data");
+        if path.exists() {
+            // Safety: called early, before any other threads use this env var.
+            unsafe { std::env::set_var("PIPER_ESPEAKNG_DATA_DIRECTORY", dir); }
+            return;
+        }
+    }
+}
+
 fn phonemize(text: &str) -> Result<String, String> {
+    ensure_espeak_data();
     let phonemes = espeak_rs::text_to_phonemes(text, "en-us", None, true, false)
         .map_err(|e| format!("Phonemization error: {e:?}"))?;
     Ok(phonemes.join(" "))

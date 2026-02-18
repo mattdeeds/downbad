@@ -83,30 +83,25 @@ fn main() -> eframe::Result<()> {
         String::new()
     };
 
-    // Fork to detach from the terminal so the shell prompt returns immediately.
-    unsafe {
-        let pid = libc::fork();
-        if pid > 0 {
-            // Parent: exit so the shell gets its prompt back.
-            std::process::exit(0);
-        } else if pid == 0 {
-            // Child: start a new session to fully detach from the terminal.
-            libc::setsid();
-            // Redirect stdin/stdout/stderr to /dev/null so macOS framework
-            // log messages don't spew into the terminal.
-            let devnull = libc::open(b"/dev/null\0".as_ptr() as *const _, libc::O_RDWR);
-            if devnull >= 0 {
-                libc::dup2(devnull, 0);
-                libc::dup2(devnull, 1);
-                libc::dup2(devnull, 2);
-                libc::close(devnull);
-            }
-        }
-        // pid == -1: fork failed; just continue in the current process.
+    // Re-launch as a detached process so the shell prompt returns immediately.
+    // Using Command instead of fork() avoids macOS window server issues with
+    // forked processes (black windows, broken rendering).
+    if std::env::var_os("DB_NO_FORK").is_none() {
+        let exe = std::env::current_exe().expect("cannot find own executable");
+        std::process::Command::new(&exe)
+            .args(&args[1..])
+            .env("DB_NO_FORK", "1")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("failed to spawn detached process");
+        std::process::exit(0);
     }
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([800.0, 600.0]),
+        renderer: eframe::Renderer::Wgpu,
         ..Default::default()
     };
 
@@ -483,6 +478,8 @@ impl eframe::App for App {
             widgets.bg_fill = egui::Color32::from_rgb(0x3b, 0x22, 0x4c);
             widgets.fg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(0xa4, 0xa0, 0xe8));
         }
+        // Brighter fg for active widgets so strong_text_color() is distinct from normal text
+        visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(0xe0, 0xdd, 0xff));
         ctx.set_visuals(visuals);
 
         // Update dirty flag once per frame
