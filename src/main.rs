@@ -8,6 +8,21 @@ use std::path::PathBuf;
 use std::sync::{mpsc, Arc, Mutex};
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
+fn strip_markdown(md: &str) -> String {
+    use pulldown_cmark::{Event, Parser, TagEnd};
+    let parser = Parser::new(md);
+    let mut text = String::new();
+    for event in parser {
+        match event {
+            Event::Text(t) | Event::Code(t) => text.push_str(&t),
+            Event::SoftBreak | Event::HardBreak => text.push('\n'),
+            Event::End(TagEnd::Paragraph | TagEnd::Heading(_)) => text.push('\n'),
+            _ => {}
+        }
+    }
+    text
+}
+
 fn whisper_model_path() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
     PathBuf::from(home)
@@ -556,7 +571,7 @@ impl eframe::App for App {
                     self.content.clone()
                 };
 
-                let text = text.trim().to_string();
+                let text = strip_markdown(text.trim());
                 if !text.is_empty() {
                     self.start_speaking(text);
                 }
