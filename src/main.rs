@@ -712,7 +712,17 @@ impl eframe::App for App {
             || self.speaking != self.prev_speaking
             || self.generating_speech != self.prev_generating_speech
         {
-            let mut title = format!("db - {}", self.path.display());
+            let name = self
+                .path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| self.path.display().to_string());
+            let display_name = if name.len() > 40 {
+                format!("{}...", &name[..37])
+            } else {
+                name
+            };
+            let mut title = format!("db - {}", display_name);
             if self.dirty {
                 title.push_str(" [modified]");
             }
